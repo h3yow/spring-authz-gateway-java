@@ -4,7 +4,7 @@ import java.time.Duration;
 import java.util.List;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
-/** 安全相关可配置项：限流阈值/窗口/锁定时长、会话与令牌有效期、CORS 允许来源。 */
+/** 安全相关可配置项：限流阈值/窗口/锁定时长、会话与令牌有效期、会话绝对最长存活时间、CORS 允许来源。 */
 @ConfigurationProperties(prefix = "auth")
 public class AuthProperties {
 
@@ -12,6 +12,7 @@ public class AuthProperties {
     private Duration loginFailureWindow = Duration.ofMinutes(5);
     private Duration lockoutDuration = Duration.ofMinutes(10);
     private Duration sessionTtl = Duration.ofMinutes(30);
+    private Duration sessionMaxLifetime = Duration.ofHours(12);
     private Duration accessTokenTtl = Duration.ofMinutes(10);
     private Duration refreshTokenTtl = Duration.ofHours(12);
     private List<String> allowedOrigins = List.of();
@@ -24,6 +25,8 @@ public class AuthProperties {
     public void setLockoutDuration(Duration v) { this.lockoutDuration = v; }
     public Duration getSessionTtl() { return sessionTtl; }
     public void setSessionTtl(Duration v) { this.sessionTtl = v; }
+    public Duration getSessionMaxLifetime() { return sessionMaxLifetime; }
+    public void setSessionMaxLifetime(Duration v) { this.sessionMaxLifetime = v; }
     public Duration getAccessTokenTtl() { return accessTokenTtl; }
     public void setAccessTokenTtl(Duration v) { this.accessTokenTtl = v; }
     public Duration getRefreshTokenTtl() { return refreshTokenTtl; }

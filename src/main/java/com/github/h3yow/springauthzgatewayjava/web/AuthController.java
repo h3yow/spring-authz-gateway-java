@@ -50,7 +50,8 @@ public class AuthController {
     public ResponseEntity<?> login(@RequestBody LoginRequest request, HttpServletRequest http) {
         char[] password = request.password() == null ? new char[0] : request.password().toCharArray();
         try {
-            AuthResult result = authService.login(request.username(), password, clientKey(http));
+            AuthResult result = authService.login(request.username(), password, clientKey(http),
+                    clientInfo(http));
             if (!result.success()) {
                 return loginFailure(result.failureReason(), request.username(), http);
             }
@@ -129,6 +130,12 @@ public class AuthController {
     private static String clientKey(HttpServletRequest http) {
         String forwarded = http.getHeader("X-Forwarded-For");
         return forwarded != null ? forwarded.split(",")[0].trim() : http.getRemoteAddr();
+    }
+
+    /** 客户端描述（User-Agent），记入凭据元数据；缺失时记为 unknown。 */
+    private static String clientInfo(HttpServletRequest http) {
+        String ua = http.getHeader("User-Agent");
+        return ua != null && !ua.isBlank() ? ua : "unknown";
     }
 
     private static String correlationId(HttpServletRequest http) {

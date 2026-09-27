@@ -24,6 +24,8 @@ import org.springframework.web.filter.OncePerRequestFilter;
  * <p>会话创建时下发一次性 CSRF 令牌（{@code X-CSRF-Token} 响应头），
  * 后续 POST/PUT/DELETE/PATCH 请求必须在同名请求头中回传，常量时间比较。
  * Bearer 令牌不依赖 Cookie，天然免疫 CSRF，予以豁免；安全方法（GET 等）与预检放行。
+ * 已失效（撤销/过期）的会话 Cookie 不触发校验——旧凭据不得拖累
+ * 仍然有效的 Bearer 凭据或公开入口（如重新登录、刷新令牌）。
  */
 public class CsrfFilter extends OncePerRequestFilter {
 
@@ -41,14 +43,20 @@ public class CsrfFilter extends OncePerRequestFilter {
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
-        if (isSafeMethod(request.getMethod()) || !usesSessionCookie(request)) {
+        if (isSafeMethod(request.getMethod())) {
             chain.doFilter(request, response);
             return;
         }
         String sessionId = readCookie(request, AuthFilter.SESSION_COOKIE);
         Optional<SessionRecord> session = sessionService.find(sessionId);
+        if (session.isEmpty()) {
+            // 未携带会话 Cookie，或 Cookie 已失效（撤销/过期）：
+            // 失效旧凭据不得拖累 Bearer 请求或公开入口，CSRF 校验不适用
+            chain.doFilter(request, response);
+            return;
+        }
         String presented = request.getHeader(CSRF_HEADER);
-        boolean valid = session.isPresent() && presented != null && MessageDigest.isEqual(
+        boolean valid = presented != null && MessageDigest.isEqual(
                 session.get().csrfToken().getBytes(StandardCharsets.UTF_8),
                 presented.getBytes(StandardCharsets.UTF_8));
         if (!valid) {
@@ -65,11 +73,6 @@ public class CsrfFilter extends OncePerRequestFilter {
 
     private static boolean isSafeMethod(String method) {
         return "GET".equals(method) || "HEAD".equals(method) || "OPTIONS".equals(method) || "TRACE".equals(method);
-    }
-
-    /** 仅当请求携带会话 Cookie 时才需要 CSRF 校验（Bearer 请求豁免）。 */
-    private static boolean usesSessionCookie(HttpServletRequest request) {
-        return readCookie(request, AuthFilter.SESSION_COOKIE) != null;
     }
 
     private static String readCookie(HttpServletRequest request, String name) {

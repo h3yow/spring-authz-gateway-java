@@ -47,6 +47,16 @@ public class AuthService {
      * @param clientKey 限流维度（如客户端 IP）
      */
     public AuthResult login(String username, char[] password, String clientKey) {
+        return login(username, password, clientKey, "unknown");
+    }
+
+    /**
+     * @param username   登录名
+     * @param password   口令（使用后由调用方清零）
+     * @param clientKey  限流维度（如客户端 IP）
+     * @param clientInfo 客户端描述（如 User-Agent），记入凭据元数据供自助管理展示
+     */
+    public AuthResult login(String username, char[] password, String clientKey, String clientInfo) {
         String guardKey = username + "|" + clientKey;
         // 1. 限流/锁定检查优先：锁定期间即使凭据正确也不得通过
         if (loginGuard.isBlocked(guardKey)) {
@@ -69,8 +79,8 @@ public class AuthService {
         // 3. 成功：清除限流计数，签发会话与令牌
         loginGuard.onSuccess(guardKey);
         UserAccount user = account.orElseThrow();
-        SessionRecord session = sessionService.create(user.username(), user.roles());
-        TokenService.TokenPair tokens = tokenService.issue(user.username(), user.roles());
+        SessionRecord session = sessionService.create(user.username(), user.roles(), clientInfo);
+        TokenService.TokenPair tokens = tokenService.issue(user.username(), user.roles(), clientInfo);
         log.info("login success user={} roles={}", username, user.roles());
         return AuthResult.ok(session, tokens.accessToken(), tokens.refreshToken());
     }

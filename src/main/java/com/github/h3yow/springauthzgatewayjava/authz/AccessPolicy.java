@@ -23,6 +23,7 @@ public class AccessPolicy {
 
     private static final List<Rule> RULES = List.of(
             new Rule("/api/public", Set.of()),
+            new Rule("/api/auth/credentials", Set.of(Role.USER, Role.ADMIN)), // 凭据自助管理需登录
             new Rule("/api/auth", Set.of()),
             new Rule("/api/admin", Set.of(Role.ADMIN)),
             new Rule("/api/user", Set.of(Role.USER, Role.ADMIN))

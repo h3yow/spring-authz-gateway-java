@@ -24,9 +24,16 @@ import org.springframework.web.filter.OncePerRequestFilter;
 /**
  * 认证与授权过滤器。
  *
- * <p>两种访问方式并存：会话 Cookie（{@code SESSION}）或 {@code Authorization: Bearer} 令牌。
+ * <p>两种访问方式并存且彼此独立：会话 Cookie（{@code SESSION}）或
+ * {@code Authorization: Bearer} 令牌；一种凭据失效不影响另一种有效凭据的使用。
  * 已撤销/过期凭据在任何入口一律视为未认证。认证通过后基于角色与资源做授权判定：
  * 未认证返回 401，已认证但越权返回 403，缺省拒绝。
+ *
+ * <p>401 响应通过 {@code reason} 字段稳定区分：{@code NO_CREDENTIALS}（未携带凭据）、
+ * {@code CREDENTIAL_EXPIRED}（凭据已过期）、{@code CREDENTIAL_REVOKED}（凭据已撤销或无效）。
+ *
+ * <p>会话认证成功时执行滑动续期，并通过 {@code X-Session-Expires-At} /
+ * {@code X-Session-Renewed} 响应头让客户端明确感知续期结果。
  *
  * <p>每个请求分配关联标识（correlation id），日志与错误响应中只出现脱敏后的凭据标识。
  */
@@ -35,6 +42,11 @@ public class AuthFilter extends OncePerRequestFilter {
     public static final String CORRELATION_ATTRIBUTE = "correlationId";
     public static final String CORRELATION_HEADER = "X-Correlation-Id";
     public static final String SESSION_COOKIE = "SESSION";
+    public static final String SESSION_EXPIRES_AT_HEADER = "X-Session-Expires-At";
+    public static final String SESSION_RENEWED_HEADER = "X-Session-Renewed";
+
+    /** 未认证细分原因：对外稳定且可区分。 */
+    public enum UnauthenticatedReason { NO_CREDENTIALS, CREDENTIAL_EXPIRED, CREDENTIAL_REVOKED }
 
     private static final Logger log = LoggerFactory.getLogger(AuthFilter.class);
 
@@ -42,6 +54,10 @@ public class AuthFilter extends OncePerRequestFilter {
     private final TokenService tokenService;
     private final AccessPolicy accessPolicy;
     private final ObjectMapper objectMapper = new ObjectMapper();
+
+    /** 认证结果：上下文（成功时）、会话续期结果（会话认证时）、失败细分原因。 */
+    private record AuthOutcome(AuthContext context, SessionService.TouchResult touch,
+                               UnauthenticatedReason reason) {}
 
     public AuthFilter(SessionService sessionService, TokenService tokenService, AccessPolicy accessPolicy) {
         this.sessionService = sessionService;
@@ -56,57 +72,87 @@ public class AuthFilter extends OncePerRequestFilter {
         request.setAttribute(CORRELATION_ATTRIBUTE, correlationId);
         response.setHeader(CORRELATION_HEADER, correlationId);
 
-        AuthContext context = authenticate(request);
-        if (context != null) {
-            request.setAttribute(AuthContext.REQUEST_ATTRIBUTE, context);
+        AuthOutcome outcome = authenticate(request);
+        if (outcome.context() != null) {
+            request.setAttribute(AuthContext.REQUEST_ATTRIBUTE, outcome.context());
+        }
+        // 会话滑动续期结果让客户端明确感知
+        if (outcome.touch() != null) {
+            response.setHeader(SESSION_EXPIRES_AT_HEADER, outcome.touch().record().expiresAt().toString());
+            response.setHeader(SESSION_RENEWED_HEADER, String.valueOf(outcome.touch().renewed()));
         }
 
-        boolean authenticated = context != null;
+        boolean authenticated = outcome.context() != null;
         Set<com.github.h3yow.springauthzgatewayjava.auth.Role> roles =
-                authenticated ? context.roles() : Set.of();
+                authenticated ? outcome.context().roles() : Set.of();
         AccessDecision decision = accessPolicy.decide(
                 request.getMethod(), request.getRequestURI(), roles, authenticated);
         if (!decision.permitted()) {
             log.info("request denied correlation={} path={} reason={}",
                     correlationId, request.getRequestURI(), decision.denyReason());
-            writeDenial(response, decision.denyReason(), correlationId);
+            writeDenial(response, decision.denyReason(), outcome.reason(), correlationId);
             return;
         }
         chain.doFilter(request, response);
     }
 
-    /** 依次尝试会话 Cookie 与 Bearer 令牌；任一有效即认证成功，均失败则未认证。 */
-    private AuthContext authenticate(HttpServletRequest request) {
+    /**
+     * 依次尝试会话 Cookie 与 Bearer 令牌；任一有效即认证成功。
+     * 均失败时按"已过期优先于已撤销"归类细分原因；未携带任何凭据则为 NO_CREDENTIALS。
+     */
+    private AuthOutcome authenticate(HttpServletRequest request) {
         String sessionId = readCookie(request, SESSION_COOKIE);
-        if (sessionId != null) {
-            Optional<SessionRecord> session = sessionService.find(sessionId);
-            if (session.isPresent()) {
-                SessionRecord s = session.get();
-                log.debug("authenticated via session session={}", Masking.mask(sessionId));
-                return new AuthContext(s.username(), s.roles(), "session", Masking.mask(sessionId));
-            }
-            log.info("session credential rejected (revoked/expired) session={}", Masking.mask(sessionId));
-        }
         String bearer = readBearer(request);
+        if (sessionId == null && bearer == null) {
+            return new AuthOutcome(null, null, UnauthenticatedReason.NO_CREDENTIALS);
+        }
+        UnauthenticatedReason reason = UnauthenticatedReason.CREDENTIAL_REVOKED;
+        if (sessionId != null) {
+            // 先判定（区分过期/撤销）再续期：过期会话会被 touch 惰性剔除，顺序不能反
+            SessionService.Evaluation evaluation = sessionService.evaluate(sessionId);
+            if (evaluation.status() == SessionService.SessionStatus.VALID) {
+                Optional<SessionService.TouchResult> touched = sessionService.touch(sessionId);
+                if (touched.isPresent()) {
+                    SessionRecord s = touched.get().record();
+                    log.debug("authenticated via session session={} renewed={}",
+                            Masking.mask(sessionId), touched.get().renewed());
+                    return new AuthOutcome(
+                            new AuthContext(s.username(), s.roles(), "session", Masking.mask(sessionId)),
+                            touched.get(), null);
+                }
+                // 判定与续期之间被并发撤销：按已撤销处理
+            } else if (evaluation.status() == SessionService.SessionStatus.EXPIRED) {
+                reason = UnauthenticatedReason.CREDENTIAL_EXPIRED;
+            }
+            log.info("session credential rejected ({}) session={}", reason, Masking.mask(sessionId));
+        }
         if (bearer != null) {
             Optional<TokenService.TokenSubject> subject = tokenService.verifyAccessToken(bearer);
             if (subject.isPresent()) {
                 TokenService.TokenSubject t = subject.get();
                 log.debug("authenticated via token token={}", Masking.mask(bearer));
-                return new AuthContext(t.username(), t.roles(), "token", Masking.mask(bearer));
+                return new AuthOutcome(
+                        new AuthContext(t.username(), t.roles(), "token", Masking.mask(bearer)),
+                        null, null);
             }
-            log.info("bearer credential rejected (revoked/expired/forged) token={}", Masking.mask(bearer));
+            if (tokenService.evaluateAccessToken(bearer) == TokenService.TokenStatus.EXPIRED) {
+                reason = UnauthenticatedReason.CREDENTIAL_EXPIRED;
+            }
+            log.info("bearer credential rejected ({}) token={}", reason, Masking.mask(bearer));
         }
-        return null;
+        return new AuthOutcome(null, null, reason);
     }
 
-    private void writeDenial(HttpServletResponse response, AccessDecision.DenyReason reason, String correlationId)
+    private void writeDenial(HttpServletResponse response, AccessDecision.DenyReason reason,
+                             UnauthenticatedReason unauthenticatedReason, String correlationId)
             throws IOException {
         int status = reason == AccessDecision.DenyReason.UNAUTHENTICATED ? 401 : 403;
         ApiError error = new ApiError(reason.name(),
                 reason == AccessDecision.DenyReason.UNAUTHENTICATED
                         ? "authentication required" : "access denied",
-                correlationId);
+                correlationId,
+                reason == AccessDecision.DenyReason.UNAUTHENTICATED && unauthenticatedReason != null
+                        ? unauthenticatedReason.name() : null);
         response.setStatus(status);
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
         response.getWriter().write(objectMapper.writeValueAsString(error));
