@@ -69,8 +69,8 @@ public class AuthService {
         // 3. 成功：清除限流计数，签发会话与令牌
         loginGuard.onSuccess(guardKey);
         UserAccount user = account.orElseThrow();
-        SessionRecord session = sessionService.create(user.username(), user.roles());
-        TokenService.TokenPair tokens = tokenService.issue(user.username(), user.roles());
+        SessionRecord session = sessionService.create(user.username(), user.roles(), clientKey);
+        TokenService.TokenPair tokens = tokenService.issue(user.username(), user.roles(), clientKey);
         log.info("login success user={} roles={}", username, user.roles());
         return AuthResult.ok(session, tokens.accessToken(), tokens.refreshToken());
     }

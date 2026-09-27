@@ -29,7 +29,7 @@ public class ResourceController {
     public Map<String, Object> profile(HttpServletRequest request) {
         AuthContext context = (AuthContext) request.getAttribute(AuthContext.REQUEST_ATTRIBUTE);
         return Map.of("username", context.username(), "roles", context.roles(),
-                "credentialKind", context.credentialKind());
+                "credentialKind", context.kind().name());
     }
 
     /** 改变状态请求：用于验证 CSRF 防护。 */

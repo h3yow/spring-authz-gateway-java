@@ -77,7 +77,7 @@ public class AuthController {
 
     @PostMapping("/refresh")
     public ResponseEntity<?> refresh(@RequestBody RefreshRequest request, HttpServletRequest http) {
-        return tokenService.refresh(request.refreshToken())
+        return tokenService.refresh(request.refreshToken(), clientKey(http))
                 .<ResponseEntity<?>>map(pair -> ResponseEntity.ok(
                         new LoginResponse(pair.accessToken(), pair.refreshToken(), "Bearer")))
                 .orElseGet(() -> {
@@ -105,7 +105,7 @@ public class AuthController {
     }
 
     private static String sessionCookie(SessionRecord session) {
-        long maxAge = Math.max(0, session.expiresAt().getEpochSecond() - session.createdAt().getEpochSecond());
+        long maxAge = Math.max(0, session.expiresAt().getEpochSecond() - session.issuedAt().getEpochSecond());
         return AuthFilter.SESSION_COOKIE + "=" + session.sessionId()
                 + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + maxAge;
     }

@@ -12,6 +12,10 @@ public class AuthProperties {
     private Duration loginFailureWindow = Duration.ofMinutes(5);
     private Duration lockoutDuration = Duration.ofMinutes(10);
     private Duration sessionTtl = Duration.ofMinutes(30);
+    /** 会话滑动空闲阈值：距最近一次使用超过该时长即失效；每次有效使用向后顺延。 */
+    private Duration sessionIdleTtl = Duration.ofMinutes(30);
+    /** 会话绝对最长存活时间：无论怎么滑动续期都不得超过自签发起的该时长。 */
+    private Duration sessionMaxTtl = Duration.ofHours(12);
     private Duration accessTokenTtl = Duration.ofMinutes(10);
     private Duration refreshTokenTtl = Duration.ofHours(12);
     private List<String> allowedOrigins = List.of();
@@ -24,6 +28,10 @@ public class AuthProperties {
     public void setLockoutDuration(Duration v) { this.lockoutDuration = v; }
     public Duration getSessionTtl() { return sessionTtl; }
     public void setSessionTtl(Duration v) { this.sessionTtl = v; }
+    public Duration getSessionIdleTtl() { return sessionIdleTtl; }
+    public void setSessionIdleTtl(Duration v) { this.sessionIdleTtl = v; }
+    public Duration getSessionMaxTtl() { return sessionMaxTtl; }
+    public void setSessionMaxTtl(Duration v) { this.sessionMaxTtl = v; }
     public Duration getAccessTokenTtl() { return accessTokenTtl; }
     public void setAccessTokenTtl(Duration v) { this.accessTokenTtl = v; }
     public Duration getRefreshTokenTtl() { return refreshTokenTtl; }

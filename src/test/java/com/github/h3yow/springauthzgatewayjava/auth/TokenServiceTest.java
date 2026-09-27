@@ -154,4 +154,81 @@ class TokenServiceTest {
         log.info("input: concurrent revoke + verify -> accepted after revoke={}", acceptedAfterRevoke.get());
         assertEquals(0, acceptedAfterRevoke.get(), "撤销完成后任何线程不得再接受该令牌");
     }
+
+    @Test
+    void singleTokenRevokeIsImmediateAndIsolated() {
+        TokenService tokens = newService();
+        TokenService.TokenPair a = tokens.issue("alice", Set.of(Role.USER), "client-a");
+        TokenService.TokenPair b = tokens.issue("alice", Set.of(Role.USER), "client-b");
+        String jtiA = tokens.jtiOf(a.accessToken());
+
+        assertTrue(tokens.revokeAccessToken(jtiA));
+        assertTrue(tokens.verifyAccessToken(a.accessToken()).isEmpty(), "被撤销令牌立即失效");
+        assertTrue(tokens.verifyAccessToken(b.accessToken()).isPresent(), "同用户其他令牌不受影响");
+        assertFalse(tokens.revokeAccessToken(jtiA), "重复撤销幂等返回 false");
+        assertFalse(tokens.revokeAccessToken("no-such-jti"));
+        log.info("decision: single revoke immediate, isolated, idempotent");
+    }
+
+    @Test
+    void stateOfAccessTokenDistinguishesRevokedExpiredUnknown() {
+        LoginGuardTest.MutableClock clock =
+                new LoginGuardTest.MutableClock(Instant.parse("2026-09-27T00:00:00Z"));
+        TokenService tokens = new TokenService(props(), clock, new byte[32]);
+        TokenService.TokenPair pair = tokens.issue("alice", Set.of(Role.USER), "client-a");
+
+        assertEquals(CredentialState.VALID, tokens.stateOfAccessToken(pair.accessToken()));
+        tokens.revokeAccessToken(tokens.jtiOf(pair.accessToken()));
+        assertEquals(CredentialState.REVOKED, tokens.stateOfAccessToken(pair.accessToken()),
+                "撤销后必须稳定判定为 REVOKED");
+
+        TokenService.TokenPair pair2 = tokens.issue("alice", Set.of(Role.USER), "client-a");
+        clock.advance(Duration.ofMinutes(11));
+        assertEquals(CredentialState.EXPIRED, tokens.stateOfAccessToken(pair2.accessToken()),
+                "超过有效期必须稳定判定为 EXPIRED");
+
+        assertEquals(CredentialState.UNKNOWN, tokens.stateOfAccessToken("garbage"));
+        // 服务端重启（新实例）后不再认可旧令牌
+        TokenService restarted = new TokenService(props(), clock, new byte[32]);
+        assertEquals(CredentialState.UNKNOWN, restarted.stateOfAccessToken(pair2.accessToken()),
+                "服务端不再认可的旧凭据判定为 UNKNOWN");
+        log.info("decision: REVOKED / EXPIRED / UNKNOWN stably distinguishable");
+    }
+
+    @Test
+    void revokeAllForUserExceptKeepsDesignatedTokenAndItsRefresh() {
+        TokenService tokens = newService();
+        TokenService.TokenPair keep = tokens.issue("alice", Set.of(Role.USER), "client-keep");
+        TokenService.TokenPair other = tokens.issue("alice", Set.of(Role.USER), "client-other");
+        TokenService.TokenPair bob = tokens.issue("bob", Set.of(Role.USER), "client-bob");
+
+        int count = tokens.revokeAllForUserExcept("alice", tokens.jtiOf(keep.accessToken()));
+        assertEquals(1, count);
+        assertEquals(0, tokens.revokeAllForUserExcept("alice", tokens.jtiOf(keep.accessToken())),
+                "重复调用幂等（此刻除保留令牌外无其他有效令牌）");
+        assertTrue(tokens.verifyAccessToken(keep.accessToken()).isPresent(), "保留令牌必须可用");
+        assertTrue(tokens.refresh(keep.refreshToken()).isPresent(), "保留令牌的刷新令牌必须可用");
+        assertTrue(tokens.verifyAccessToken(other.accessToken()).isEmpty());
+        assertTrue(tokens.refresh(other.refreshToken()).isEmpty(), "其他刷新令牌一并注销");
+        assertTrue(tokens.verifyAccessToken(bob.accessToken()).isPresent(), "其他用户不受影响");
+        log.info("decision: revoke-except keeps exactly the designated token pair");
+    }
+
+    @Test
+    void verifyUpdatesLastUsedAtAndActiveInfosAreMetadataOnly() {
+        LoginGuardTest.MutableClock clock =
+                new LoginGuardTest.MutableClock(Instant.parse("2026-09-27T00:00:00Z"));
+        TokenService tokens = new TokenService(props(), clock, new byte[32]);
+        TokenService.TokenPair pair = tokens.issue("alice", Set.of(Role.USER), "client-a");
+        clock.advance(Duration.ofMinutes(3));
+        tokens.verifyAccessToken(pair.accessToken());
+
+        var infos = tokens.activeInfos("alice");
+        assertEquals(1, infos.size());
+        var info = infos.get(0);
+        assertEquals("client-a", info.clientKey());
+        assertEquals(clock.instant(), info.lastUsedAt(), "最近使用时间应随有效校验更新");
+        assertFalse(info.toString().contains(pair.accessToken()), "视图不得包含令牌原文");
+        log.info("decision: lastUsedAt tracked; view is metadata-only");
+    }
 }
