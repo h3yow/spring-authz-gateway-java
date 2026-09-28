@@ -16,9 +16,14 @@ import org.springframework.stereotype.Component;
 /**
  * 会话签发、滑动续期与撤销。
  *
- * <p>会话记录不可变，撤销即从注册表原子删除，立即生效；续期通过
- * {@code computeIfPresent} 原子替换为顺延后的新记录——撤销与续期竞争时，
+ * <p>会话记录不可变。撤销即从注册表原子删除，立即生效；续期在同一个
+ * {@code compute} 内完成"判定 + 续期"，撤销与续期竞争时以撤销为准——
  * 已删除的会话不会被续期"复活"，过期会话也不会因续期重新可用。
+ *
+ * <p>拒绝原因稳定：过期会话不会在判定后立即从注册表删除（否则下一次请求会
+ * 漂移成"已撤销/未知"），而是作为过期墓碑保留，使同一凭据的重复请求始终
+ * 得到 EXPIRED。墓碑在 {@code absoluteExpiresAt + auth.revocation-retention}
+ * 之后惰性清除（有界内存）；显式撤销会移除墓碑，撤销优先于过期语义。
  *
  * <p>滑动续期语义：每次使用刷新 {@code lastUsedAt}；当剩余有效期不足
  * 空闲阈值（{@code auth.session-ttl}）的一半时，{@code expiresAt} 顺延为
@@ -39,6 +44,12 @@ public class SessionService {
 
     /** 续期结果：当前记录 + 本次是否真正顺延了过期时间。 */
     public record TouchResult(SessionRecord record, boolean renewed) {}
+
+    /**
+     * 原子认证结果：状态 + 有效时的续期结果。
+     * 判定与续期在同一个原子操作内完成，二者之间不存在被并发撤销的窗口。
+     */
+    public record SessionAuthResult(SessionStatus status, TouchResult touch) {}
 
     private final AuthProperties properties;
     private final Clock clock;
@@ -87,11 +98,43 @@ public class SessionService {
         if (record == null) {
             return new Evaluation(SessionStatus.UNKNOWN, null);
         }
-        if (record.expired(clock.instant())) {
-            sessions.remove(sessionId, record); // 惰性剔除过期会话
-            return new Evaluation(SessionStatus.EXPIRED, null);
+        Instant now = clock.instant();
+        if (!record.expired(now)) {
+            return new Evaluation(SessionStatus.VALID, record);
         }
-        return new Evaluation(SessionStatus.VALID, record);
+        // 过期墓碑：保留期内稳定返回 EXPIRED，不做惰性删除；超过保留期才清除
+        if (tombstoneExpired(record, now)) {
+            sessions.remove(sessionId, record);
+            return new Evaluation(SessionStatus.UNKNOWN, null);
+        }
+        return new Evaluation(SessionStatus.EXPIRED, null);
+    }
+
+    /**
+     * 原子的"判定 + 滑动续期"：认证过滤器的唯一入口。
+     * 有效会话在同一个 compute 内完成续期；过期会话作为墓碑保留并稳定返回
+     * EXPIRED；已撤销（不存在）返回 UNKNOWN。不存在判定与续期之间被并发撤销
+     * 的窗口。
+     */
+    public SessionAuthResult authenticate(String sessionId) {
+        if (sessionId == null) {
+            return new SessionAuthResult(SessionStatus.UNKNOWN, null);
+        }
+        Instant now = clock.instant();
+        SessionAuthResult[] result = new SessionAuthResult[1];
+        sessions.computeIfPresent(sessionId, (id, current) -> {
+            if (current.expired(now)) {
+                if (tombstoneExpired(current, now)) {
+                    return null; // 墓碑超过保留期，清除
+                }
+                result[0] = new SessionAuthResult(SessionStatus.EXPIRED, null);
+                return current; // 保留过期墓碑，绝不复活
+            }
+            TouchResult touched = renew(current, now);
+            result[0] = new SessionAuthResult(SessionStatus.VALID, touched);
+            return touched.record();
+        });
+        return result[0] != null ? result[0] : new SessionAuthResult(SessionStatus.UNKNOWN, null);
     }
 
     /**
@@ -108,31 +151,39 @@ public class SessionService {
         TouchResult[] result = new TouchResult[1];
         sessions.computeIfPresent(sessionId, (id, current) -> {
             if (current.expired(now)) {
-                return null; // 过期即剔除，绝不复活
+                if (tombstoneExpired(current, now)) {
+                    return null;
+                }
+                return current; // 过期墓碑保留，不复活
             }
-            boolean renewable = current.expiresAt().isBefore(current.absoluteExpiresAt())
-                    && now.plus(properties.getSessionTtl().dividedBy(2)).isAfter(current.expiresAt());
-            Instant newExpiry = renewable
-                    ? min(now.plus(properties.getSessionTtl()), current.absoluteExpiresAt())
-                    : current.expiresAt();
-            boolean renewed = newExpiry.isAfter(current.expiresAt());
-            result[0] = new TouchResult(new SessionRecord(
-                    current.sessionId(), current.credentialId(), current.username(),
-                    current.roles(), current.csrfToken(), current.client(),
-                    current.createdAt(), now, newExpiry, current.absoluteExpiresAt()), renewed);
+            result[0] = renew(current, now);
             return result[0].record();
         });
         return Optional.ofNullable(result[0]);
     }
 
-    /** 撤销单个会话，立即生效；重复撤销是幂等 no-op。 */
+    /** 计算续期后的新记录（纯函数，调用方须在原子块内）。 */
+    private TouchResult renew(SessionRecord current, Instant now) {
+        boolean renewable = current.expiresAt().isBefore(current.absoluteExpiresAt())
+                && now.plus(properties.getSessionTtl().dividedBy(2)).isAfter(current.expiresAt());
+        Instant newExpiry = renewable
+                ? min(now.plus(properties.getSessionTtl()), current.absoluteExpiresAt())
+                : current.expiresAt();
+        boolean renewed = newExpiry.isAfter(current.expiresAt());
+        return new TouchResult(new SessionRecord(
+                current.sessionId(), current.credentialId(), current.username(),
+                current.roles(), current.csrfToken(), current.client(),
+                current.createdAt(), now, newExpiry, current.absoluteExpiresAt()), renewed);
+    }
+
+    /** 撤销单个会话，立即生效；重复撤销是幂等 no-op（过期墓碑同样可被显式撤销移除）。 */
     public void revoke(String sessionId) {
         if (sessionId != null && sessions.remove(sessionId) != null) {
             log.info("session revoked session={}", Masking.mask(sessionId));
         }
     }
 
-    /** 按公开凭据标识撤销：仅当凭据属于该用户时生效，返回是否命中。 */
+    /** 按公开凭据标识撤销：仅当凭据属于该用户时生效，返回是否命中（含过期墓碑）。 */
     public boolean revokeByCredentialId(String username, String credentialId) {
         if (credentialId == null) {
             return false;
@@ -148,7 +199,7 @@ public class SessionService {
         return false;
     }
 
-    /** 撤销某用户的全部会话（如登出所有设备、口令变更）。 */
+    /** 撤销某用户的全部会话（如登出所有设备、口令变更），含过期墓碑。 */
     public void revokeAllForUser(String username) {
         sessions.values().removeIf(s -> s.username().equals(username));
         log.info("all sessions revoked user={}", username);
@@ -161,19 +212,26 @@ public class SessionService {
         log.info("other sessions revoked user={} keep={}", username, Masking.mask(keepSessionId));
     }
 
-    /** 列出某用户当前仍有效的会话（过期会话顺带惰性剔除）。 */
+    /** 列出某用户当前仍有效的会话（过期墓碑不展示，超过保留期顺带清除）。 */
     public List<SessionRecord> listForUser(String username) {
         Instant now = clock.instant();
         return sessions.values().stream()
                 .filter(s -> s.username().equals(username))
                 .filter(s -> {
                     if (s.expired(now)) {
-                        sessions.remove(s.sessionId(), s);
+                        if (tombstoneExpired(s, now)) {
+                            sessions.remove(s.sessionId(), s);
+                        }
                         return false;
                     }
                     return true;
                 })
                 .toList();
+    }
+
+    /** 墓碑是否已超过保留期（绝对上限之后再保留 revocation-retention）。 */
+    private boolean tombstoneExpired(SessionRecord record, Instant now) {
+        return now.isAfter(record.absoluteExpiresAt().plus(properties.getRevocationRetention()));
     }
 
     private static Instant min(Instant a, Instant b) {

@@ -18,6 +18,7 @@ import java.util.Set;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.web.filter.OncePerRequestFilter;
 
@@ -43,6 +44,7 @@ public class AuthFilter extends OncePerRequestFilter {
     public static final String CORRELATION_HEADER = "X-Correlation-Id";
     public static final String SESSION_COOKIE = "SESSION";
     public static final String SESSION_EXPIRES_AT_HEADER = "X-Session-Expires-At";
+    public static final String SESSION_ABSOLUTE_EXPIRES_AT_HEADER = "X-Session-Absolute-Expires-At";
     public static final String SESSION_RENEWED_HEADER = "X-Session-Renewed";
 
     /** 未认证细分原因：对外稳定且可区分。 */
@@ -55,9 +57,12 @@ public class AuthFilter extends OncePerRequestFilter {
     private final AccessPolicy accessPolicy;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    /** 认证结果：上下文（成功时）、会话续期结果（会话认证时）、失败细分原因。 */
+    /**
+     * 认证结果：上下文（成功时）、会话续期结果（会话认证时）、失败细分原因，
+     * 以及是否需要清除浏览器侧失效会话 Cookie。
+     */
     private record AuthOutcome(AuthContext context, SessionService.TouchResult touch,
-                               UnauthenticatedReason reason) {}
+                               UnauthenticatedReason reason, boolean clearSessionCookie) {}
 
     public AuthFilter(SessionService sessionService, TokenService tokenService, AccessPolicy accessPolicy) {
         this.sessionService = sessionService;
@@ -76,10 +81,23 @@ public class AuthFilter extends OncePerRequestFilter {
         if (outcome.context() != null) {
             request.setAttribute(AuthContext.REQUEST_ATTRIBUTE, outcome.context());
         }
-        // 会话滑动续期结果让客户端明确感知
-        if (outcome.touch() != null) {
-            response.setHeader(SESSION_EXPIRES_AT_HEADER, outcome.touch().record().expiresAt().toString());
+        // 登出由控制器显式终结会话：不重发滑动 Cookie，避免与清除指令并列
+        boolean logoutPath = "POST".equals(request.getMethod())
+                && "/api/auth/logout".equals(request.getRequestURI());
+        // 会话滑动续期结果让客户端明确感知（含跨域，见 CORS exposed-headers）
+        if (outcome.touch() != null && !logoutPath) {
+            SessionRecord record = outcome.touch().record();
+            response.setHeader(SESSION_EXPIRES_AT_HEADER, record.expiresAt().toString());
+            response.setHeader(SESSION_ABSOLUTE_EXPIRES_AT_HEADER, record.absoluteExpiresAt().toString());
             response.setHeader(SESSION_RENEWED_HEADER, String.valueOf(outcome.touch().renewed()));
+            // 关键：每次会话请求都按当前服务端失效时间重新下发 Cookie，
+            // 浏览器 Cookie 的存活时间随之滑动，与服务端一致地延长。
+            response.addHeader(HttpHeaders.SET_COOKIE, SessionCookies.issue(record));
+        }
+        // 服务端判定会话凭据已终结（过期/撤销）时，立即清除浏览器侧登录态，两端一致结束。
+        // 登出路径的清除指令由控制器自身下发，这里不重复。
+        if (outcome.clearSessionCookie() && !logoutPath) {
+            response.addHeader(HttpHeaders.SET_COOKIE, SessionCookies.clear());
         }
 
         boolean authenticated = outcome.context() != null;
@@ -104,24 +122,22 @@ public class AuthFilter extends OncePerRequestFilter {
         String sessionId = readCookie(request, SESSION_COOKIE);
         String bearer = readBearer(request);
         if (sessionId == null && bearer == null) {
-            return new AuthOutcome(null, null, UnauthenticatedReason.NO_CREDENTIALS);
+            return new AuthOutcome(null, null, UnauthenticatedReason.NO_CREDENTIALS, false);
         }
         UnauthenticatedReason reason = UnauthenticatedReason.CREDENTIAL_REVOKED;
+        boolean sessionPresented = sessionId != null;
         if (sessionId != null) {
-            // 先判定（区分过期/撤销）再续期：过期会话会被 touch 惰性剔除，顺序不能反
-            SessionService.Evaluation evaluation = sessionService.evaluate(sessionId);
-            if (evaluation.status() == SessionService.SessionStatus.VALID) {
-                Optional<SessionService.TouchResult> touched = sessionService.touch(sessionId);
-                if (touched.isPresent()) {
-                    SessionRecord s = touched.get().record();
-                    log.debug("authenticated via session session={} renewed={}",
-                            Masking.mask(sessionId), touched.get().renewed());
-                    return new AuthOutcome(
-                            new AuthContext(s.username(), s.roles(), "session", Masking.mask(sessionId)),
-                            touched.get(), null);
-                }
-                // 判定与续期之间被并发撤销：按已撤销处理
-            } else if (evaluation.status() == SessionService.SessionStatus.EXPIRED) {
+            // 判定 + 续期原子完成：不存在二者之间被并发撤销而漂移的窗口
+            SessionService.SessionAuthResult auth = sessionService.authenticate(sessionId);
+            if (auth.status() == SessionService.SessionStatus.VALID && auth.touch() != null) {
+                SessionRecord s = auth.touch().record();
+                log.debug("authenticated via session session={} renewed={}",
+                        Masking.mask(sessionId), auth.touch().renewed());
+                return new AuthOutcome(
+                        new AuthContext(s.username(), s.roles(), "session", Masking.mask(sessionId)),
+                        auth.touch(), null, false);
+            }
+            if (auth.status() == SessionService.SessionStatus.EXPIRED) {
                 reason = UnauthenticatedReason.CREDENTIAL_EXPIRED;
             }
             log.info("session credential rejected ({}) session={}", reason, Masking.mask(sessionId));
@@ -133,14 +149,15 @@ public class AuthFilter extends OncePerRequestFilter {
                 log.debug("authenticated via token token={}", Masking.mask(bearer));
                 return new AuthOutcome(
                         new AuthContext(t.username(), t.roles(), "token", Masking.mask(bearer)),
-                        null, null);
+                        null, null, false);
             }
             if (tokenService.evaluateAccessToken(bearer) == TokenService.TokenStatus.EXPIRED) {
                 reason = UnauthenticatedReason.CREDENTIAL_EXPIRED;
             }
             log.info("bearer credential rejected ({}) token={}", reason, Masking.mask(bearer));
         }
-        return new AuthOutcome(null, null, reason);
+        // 携带了失效会话 Cookie 且最终未认证：终结浏览器侧登录态（有效 Bearer 成功时不会走到这里）
+        return new AuthOutcome(null, null, reason, sessionPresented);
     }
 
     private void writeDenial(HttpServletResponse response, AccessDecision.DenyReason reason,

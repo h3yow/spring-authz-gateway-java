@@ -15,6 +15,8 @@ public class AuthProperties {
     private Duration sessionMaxLifetime = Duration.ofHours(12);
     private Duration accessTokenTtl = Duration.ofMinutes(10);
     private Duration refreshTokenTtl = Duration.ofHours(12);
+    /** 拒绝原因稳定期：撤销/过期墓碑在此期间保留，使同一凭据的拒绝原因不随重复请求漂移。 */
+    private Duration revocationRetention = Duration.ofHours(24);
     private List<String> allowedOrigins = List.of();
 
     public int getLoginMaxFailures() { return loginMaxFailures; }
@@ -31,6 +33,8 @@ public class AuthProperties {
     public void setAccessTokenTtl(Duration v) { this.accessTokenTtl = v; }
     public Duration getRefreshTokenTtl() { return refreshTokenTtl; }
     public void setRefreshTokenTtl(Duration v) { this.refreshTokenTtl = v; }
+    public Duration getRevocationRetention() { return revocationRetention; }
+    public void setRevocationRetention(Duration v) { this.revocationRetention = v; }
     public List<String> getAllowedOrigins() { return allowedOrigins; }
     public void setAllowedOrigins(List<String> v) { this.allowedOrigins = v; }
 }

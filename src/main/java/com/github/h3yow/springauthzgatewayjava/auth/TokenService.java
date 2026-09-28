@@ -49,8 +49,11 @@ public class TokenService {
     /** 访问令牌判定结果：有效 / 已过期 / 已撤销或无效（对外不再细分，避免泄露）。 */
     public enum TokenStatus { VALID, EXPIRED, INVALID }
 
-    /** 刷新令牌凭据的公开元数据（不含任何凭据本体）。 */
-    public record RefreshMeta(String credentialId, String username, String client,
+    /** 刷新令牌判定结果：有效 / 已过期 / 已撤销、已用或无效。 */
+    public enum RefreshStatus { VALID, EXPIRED, INVALID }
+
+    /** 刷新令牌凭据的公开元数据（不含任何凭据本体）。jti 仅用于内部撤销墓碑登记。 */
+    public record RefreshMeta(String refreshJti, String credentialId, String username, String client,
                               Instant issuedAt, Instant lastUsedAt, Instant expiresAt) {}
 
     private record Payload(String sub, Set<Role> roles, String jti, String type,
@@ -69,8 +72,14 @@ public class TokenService {
     private final ConcurrentHashMap<String, RefreshMeta> refreshRegistry = new ConcurrentHashMap<>();
     /** 访问令牌登记：jti -> 元数据（过期后惰性清理）。 */
     private final ConcurrentHashMap<String, AccessMeta> accessRegistry = new ConcurrentHashMap<>();
-    /** 已撤销访问令牌拒绝名单：jti -> 原过期时间（过期后惰性清理）。 */
+    /** 已撤销访问令牌拒绝名单：jti -> 可清除时间（令牌自然过期 + 原因稳定保留期）。 */
     private final ConcurrentHashMap<String, Instant> revokedAccessJti = new ConcurrentHashMap<>();
+    /**
+     * 已撤销/已用刷新令牌墓碑：jti -> 可清除时间。
+     * 刷新令牌从注册表移除（旋转消费或撤销）后据此稳定返回 INVALID，
+     * 而不会在其自然过期前后漂移成 EXPIRED。
+     */
+    private final ConcurrentHashMap<String, Instant> revokedRefreshJti = new ConcurrentHashMap<>();
 
     @org.springframework.beans.factory.annotation.Autowired
     public TokenService(AuthProperties properties) {
@@ -112,7 +121,7 @@ public class TokenService {
                 now, refreshExp, credentialId));
         // 旋转时保留原凭据的签发时间与客户端，最近使用时间更新为当前
         Instant issuedAt = previous != null ? previous.issuedAt() : now;
-        refreshRegistry.put(refreshJti, new RefreshMeta(credentialId, username, client,
+        refreshRegistry.put(refreshJti, new RefreshMeta(refreshJti, credentialId, username, client,
                 issuedAt, now, refreshExp));
         accessRegistry.put(accessJti, new AccessMeta(username, credentialId, accessExp));
         log.info("token pair issued user={} credential={} refreshJti={}", username,
@@ -130,20 +139,47 @@ public class TokenService {
                 .map(p -> new TokenSubject(p.sub(), p.roles()));
     }
 
-    /** 区分"有效 / 已过期 / 已撤销或无效"的判定，供认证过滤器给出可区分的拒绝原因。 */
+    /**
+     * 区分"有效 / 已过期 / 已撤销或无效"的判定，供认证过滤器给出可区分的拒绝原因。
+     *
+     * <p>判定顺序保证原因稳定：撤销（纪元/拒绝名单）优先于自然过期——一个被撤销的
+     * 令牌即使随后越过自身过期点，重复请求仍稳定返回 INVALID，而不会漂移成 EXPIRED；
+     * 未被撤销的过期令牌稳定返回 EXPIRED（拒绝名单墓碑在保留期内不清除）。
+     */
     public TokenStatus evaluateAccessToken(String token) {
         Optional<Payload> parsed = decode(token).filter(p -> TYPE_ACCESS.equals(p.type()));
         if (parsed.isEmpty()) {
             return TokenStatus.INVALID;
         }
         Payload p = parsed.get();
+        if (!notRevoked(p) || revokedAccessJti.containsKey(p.jti())) {
+            return TokenStatus.INVALID; // 撤销优先：即使已自然过期也稳定为 INVALID
+        }
         if (!notExpired(p)) {
             return TokenStatus.EXPIRED;
         }
-        if (!notRevoked(p) || revokedAccessJti.containsKey(p.jti())) {
-            return TokenStatus.INVALID;
-        }
         return TokenStatus.VALID;
+    }
+
+    /**
+     * 刷新令牌的可区分判定：撤销/已用/无效（INVALID）优先于自然过期（EXPIRED），
+     * 同一刷新令牌在重复请求与不同入口上原因稳定。
+     */
+    public RefreshStatus evaluateRefreshToken(String token) {
+        Optional<Payload> parsed = decode(token).filter(p -> TYPE_REFRESH.equals(p.type()));
+        if (parsed.isEmpty()) {
+            return RefreshStatus.INVALID;
+        }
+        Payload p = parsed.get();
+        if (!notRevoked(p) || revokedRefreshJti.containsKey(p.jti())) {
+            return RefreshStatus.INVALID; // 撤销/已用优先，绝不漂移成 EXPIRED
+        }
+        if (!notExpired(p)) {
+            return RefreshStatus.EXPIRED;
+        }
+        RefreshMeta meta = refreshRegistry.get(p.jti());
+        return meta != null && meta.username().equals(p.sub())
+                ? RefreshStatus.VALID : RefreshStatus.INVALID;
     }
 
     /**
@@ -154,7 +190,6 @@ public class TokenService {
     public Optional<TokenPair> refresh(String refreshToken) {
         Optional<Payload> parsed = decode(refreshToken)
                 .filter(p -> TYPE_REFRESH.equals(p.type()))
-                .filter(this::notExpired)
                 .filter(this::notRevoked);
         if (parsed.isEmpty()) {
             return Optional.empty();
@@ -162,18 +197,37 @@ public class TokenService {
         Payload p = parsed.get();
         // 原子移除：并发下只有一个线程能移除成功
         RefreshMeta meta = refreshRegistry.remove(p.jti());
-        if (meta == null || !meta.username().equals(p.sub())) {
-            log.info("refresh token already used or revoked jti={}", Masking.mask(p.jti()));
+        if (meta == null || !meta.username().equals(p.sub()) || clock.instant().isAfter(p.exp())) {
+            // 已用/撤销/过期：登记墓碑，使后续重复请求的拒绝原因稳定不漂移
+            if (revokedRefreshJti.putIfAbsent(p.jti(), p.exp().plus(properties.getRevocationRetention())) == null
+                    && meta != null) {
+                log.info("refresh token already used or revoked jti={}", Masking.mask(p.jti()));
+            }
             return Optional.empty();
         }
+        // 消费成功：jti 进入单次使用墓碑（保留到自然过期 + 稳定期），并发重复消费稳定 INVALID
+        revokedRefreshJti.put(p.jti(), p.exp().plus(properties.getRevocationRetention()));
         return Optional.of(issueInternal(p.sub(), p.roles(), meta.client(), p.cid(), meta));
     }
 
     /** 撤销某用户的全部令牌：提升撤销纪元并注销其全部刷新令牌，立即生效。 */
     public void revokeAllForUser(String username) {
-        revocationEpoch.put(username, clock.instant());
-        refreshRegistry.values().removeIf(m -> m.username().equals(username));
+        Instant now = clock.instant();
+        revocationEpoch.put(username, now);
+        refreshRegistry.values().removeIf(m -> {
+            if (m.username().equals(username)) {
+                revokedRefreshJti.put(m.refreshJti(), m.expiresAt().plus(properties.getRevocationRetention()));
+                return true;
+            }
+            return false;
+        });
+        accessRegistry.forEach((jti, meta) -> {
+            if (meta.username().equals(username)) {
+                revokedAccessJti.put(jti, meta.exp().plus(properties.getRevocationRetention()));
+            }
+        });
         accessRegistry.values().removeIf(m -> m.username().equals(username));
+        purgeExpired(now);
         log.info("all tokens revoked user={}", username);
     }
 
@@ -186,11 +240,16 @@ public class TokenService {
      */
     public void revokeAllForUserExcept(String username, String keepCredentialId) {
         Instant now = clock.instant();
-        refreshRegistry.values().removeIf(m -> m.username().equals(username)
-                && !m.credentialId().equals(keepCredentialId));
+        refreshRegistry.values().removeIf(m -> {
+            if (m.username().equals(username) && !m.credentialId().equals(keepCredentialId)) {
+                revokedRefreshJti.put(m.refreshJti(), m.expiresAt().plus(properties.getRevocationRetention()));
+                return true;
+            }
+            return false;
+        });
         accessRegistry.forEach((jti, meta) -> {
             if (meta.username().equals(username) && !meta.cid().equals(keepCredentialId)) {
-                revokedAccessJti.put(jti, meta.exp());
+                revokedAccessJti.put(jti, meta.exp().plus(properties.getRevocationRetention()));
                 accessRegistry.remove(jti, meta);
             }
         });
@@ -206,12 +265,16 @@ public class TokenService {
         boolean[] hit = {false};
         refreshRegistry.values().removeIf(m -> {
             boolean match = m.credentialId().equals(credentialId) && m.username().equals(username);
-            hit[0] |= match;
+            if (match) {
+                hit[0] = true;
+                revokedRefreshJti.put(m.refreshJti(), m.expiresAt().plus(properties.getRevocationRetention()));
+            }
             return match;
         });
         accessRegistry.forEach((jti, meta) -> {
             if (meta.cid().equals(credentialId) && meta.username().equals(username)) {
-                revokedAccessJti.put(jti, meta.exp());
+                hit[0] = true;
+                revokedAccessJti.put(jti, meta.exp().plus(properties.getRevocationRetention()));
                 accessRegistry.remove(jti, meta);
             }
         });
@@ -222,10 +285,14 @@ public class TokenService {
         return hit[0];
     }
 
-    /** 撤销单个刷新令牌（如登出）。 */
+    /** 撤销单个刷新令牌（如登出）；登记墓碑保证重复提交的拒绝原因稳定。 */
     public void revokeRefreshToken(String refreshToken) {
         decode(refreshToken).filter(p -> TYPE_REFRESH.equals(p.type()))
-                .ifPresent(p -> refreshRegistry.remove(p.jti()));
+                .ifPresent(p -> {
+                    RefreshMeta meta = refreshRegistry.remove(p.jti());
+                    Instant exp = meta != null ? meta.expiresAt() : p.exp();
+                    revokedRefreshJti.put(p.jti(), exp.plus(properties.getRevocationRetention()));
+                });
     }
 
     /** 提取访问令牌的公开凭据标识（用于"撤销其他全部凭据"时识别当前凭据）。 */
@@ -244,11 +311,16 @@ public class TokenService {
                 .toList();
     }
 
-    /** 惰性清理过期条目，避免注册表无界增长。 */
+    /**
+     * 惰性清理，避免注册表无界增长：
+     * 注册表条目按自身过期时间清除；拒绝名单/撤销墓碑按"自然过期 + 稳定保留期"清除，
+     * 保留期内同一凭据的拒绝原因不会漂移。
+     */
     private void purgeExpired(Instant now) {
         refreshRegistry.values().removeIf(m -> !now.isBefore(m.expiresAt()));
         accessRegistry.values().removeIf(m -> !now.isBefore(m.exp()));
-        revokedAccessJti.values().removeIf(exp -> !now.isBefore(exp));
+        revokedAccessJti.values().removeIf(cutoff -> !now.isBefore(cutoff));
+        revokedRefreshJti.values().removeIf(cutoff -> !now.isBefore(cutoff));
     }
 
     private boolean notExpired(Payload p) {

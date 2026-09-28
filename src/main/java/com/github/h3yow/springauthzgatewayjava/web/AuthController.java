@@ -56,10 +56,14 @@ public class AuthController {
                 return loginFailure(result.failureReason(), request.username(), http);
             }
             SessionRecord session = result.session();
-            // 会话 Cookie：HttpOnly + SameSite=Strict，配合 CSRF 令牌双重防护
+            // 会话 Cookie：HttpOnly + SameSite=Strict，Max-Age 与服务端失效时间对齐
             return ResponseEntity.ok()
-                    .header(HttpHeaders.SET_COOKIE, sessionCookie(session))
+                    .header(HttpHeaders.SET_COOKIE, SessionCookies.issue(session))
                     .header(CsrfFilter.CSRF_HEADER, session.csrfToken())
+                    .header(AuthFilter.SESSION_EXPIRES_AT_HEADER, session.expiresAt().toString())
+                    .header(AuthFilter.SESSION_ABSOLUTE_EXPIRES_AT_HEADER,
+                            session.absoluteExpiresAt().toString())
+                    .header(AuthFilter.SESSION_RENEWED_HEADER, "true")
                     .body(new LoginResponse(result.accessToken(), result.refreshToken(), "Bearer"));
         } finally {
             Arrays.fill(password, '\0'); // 口令用后即清零
@@ -72,20 +76,34 @@ public class AuthController {
         String sessionId = readSessionCookie(http);
         authService.logout(sessionId, context != null ? context.username() : null);
         return ResponseEntity.noContent()
-                .header(HttpHeaders.SET_COOKIE, expireSessionCookie())
+                .header(HttpHeaders.SET_COOKIE, SessionCookies.clear())
                 .build();
     }
 
     @PostMapping("/refresh")
-    public ResponseEntity<?> refresh(@RequestBody RefreshRequest request, HttpServletRequest http) {
-        return tokenService.refresh(request.refreshToken())
+    public ResponseEntity<?> refresh(@RequestBody(required = false) RefreshRequest request,
+                                     HttpServletRequest http) {
+        String refreshToken = request == null ? null : request.refreshToken();
+        if (refreshToken == null || refreshToken.isBlank()) {
+            // 未携带凭据：与访问受保护资源时的三态语义保持一致
+            return ResponseEntity.status(401).body(new ApiError(
+                    "UNAUTHENTICATED", "authentication required", correlationId(http),
+                    AuthFilter.UnauthenticatedReason.NO_CREDENTIALS.name()));
+        }
+        // 先取可区分、稳定的原因（撤销/已用优先于过期），再执行单次使用旋转
+        TokenService.RefreshStatus status = tokenService.evaluateRefreshToken(refreshToken);
+        return tokenService.refresh(refreshToken)
                 .<ResponseEntity<?>>map(pair -> ResponseEntity.ok(
                         new LoginResponse(pair.accessToken(), pair.refreshToken(), "Bearer")))
                 .orElseGet(() -> {
-                    log.info("refresh rejected correlation={}", correlationId(http));
-                    return ResponseEntity.status(401).body(
-                            new ApiError("INVALID_CREDENTIALS", "refresh token invalid or already used",
-                                    correlationId(http)));
+                    AuthFilter.UnauthenticatedReason reason =
+                            status == TokenService.RefreshStatus.EXPIRED
+                                    ? AuthFilter.UnauthenticatedReason.CREDENTIAL_EXPIRED
+                                    : AuthFilter.UnauthenticatedReason.CREDENTIAL_REVOKED;
+                    log.info("refresh rejected correlation={} reason={}", correlationId(http), reason);
+                    return ResponseEntity.status(401).body(new ApiError(
+                            "UNAUTHENTICATED", "refresh token invalid, expired or already used",
+                            correlationId(http), reason.name()));
                 });
     }
 
@@ -103,16 +121,6 @@ public class AuthController {
         log.info("login rejected user={} correlation={}", username, correlationId);
         return ResponseEntity.status(401).body(
                 new ApiError("INVALID_CREDENTIALS", "invalid username or password", correlationId));
-    }
-
-    private static String sessionCookie(SessionRecord session) {
-        long maxAge = Math.max(0, session.expiresAt().getEpochSecond() - session.createdAt().getEpochSecond());
-        return AuthFilter.SESSION_COOKIE + "=" + session.sessionId()
-                + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + maxAge;
-    }
-
-    private static String expireSessionCookie() {
-        return AuthFilter.SESSION_COOKIE + "=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0";
     }
 
     private static String readSessionCookie(HttpServletRequest http) {

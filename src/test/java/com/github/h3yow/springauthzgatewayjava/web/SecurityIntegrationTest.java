@@ -131,6 +131,13 @@ class SecurityIntegrationTest {
         log.info("input: preflight origin=http://localhost:3000 -> ACAO={}",
                 ok.getResponse().getHeader("Access-Control-Allow-Origin"));
         assertEquals("http://localhost:3000", ok.getResponse().getHeader("Access-Control-Allow-Origin"));
+        // 跨域前端必须能读到滑动续期感知头
+        String exposed = ok.getResponse().getHeader("Access-Control-Expose-Headers");
+        assertNotNull(exposed);
+        assertTrue(exposed.contains(AuthFilter.SESSION_EXPIRES_AT_HEADER)
+                        && exposed.contains(AuthFilter.SESSION_ABSOLUTE_EXPIRES_AT_HEADER)
+                        && exposed.contains(AuthFilter.SESSION_RENEWED_HEADER),
+                "续期感知头必须在 CORS Expose-Headers 中，跨域才可读: " + exposed);
 
         MvcResult evil = mvc.perform(options("/api/user/profile")
                         .header("Origin", "http://evil.example")
