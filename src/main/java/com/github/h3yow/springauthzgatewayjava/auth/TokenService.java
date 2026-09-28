@@ -6,6 +6,7 @@ import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.List;
@@ -59,6 +60,9 @@ public class TokenService {
     /** 访问令牌登记元数据，用于按凭据撤销时即时失效。 */
     private record AccessMeta(String username, String cid, Instant exp) {}
 
+    /** 拒绝名单条目：原过期时间 + 撤销时刻，撤销后保留一个访问 TTL 的宽限窗口。 */
+    private record RevokedAccess(Instant exp, Instant revokedAt) {}
+
     private final AuthProperties properties;
     private final Clock clock;
     private final byte[] secret;
@@ -69,8 +73,8 @@ public class TokenService {
     private final ConcurrentHashMap<String, RefreshMeta> refreshRegistry = new ConcurrentHashMap<>();
     /** 访问令牌登记：jti -> 元数据（过期后惰性清理）。 */
     private final ConcurrentHashMap<String, AccessMeta> accessRegistry = new ConcurrentHashMap<>();
-    /** 已撤销访问令牌拒绝名单：jti -> 原过期时间（过期后惰性清理）。 */
-    private final ConcurrentHashMap<String, Instant> revokedAccessJti = new ConcurrentHashMap<>();
+    /** 已撤销访问令牌拒绝名单：jti -> 撤销信息（原过期时间 + 撤销时刻，过宽限窗口后惰性清理）。 */
+    private final ConcurrentHashMap<String, RevokedAccess> revokedAccessJti = new ConcurrentHashMap<>();
 
     @org.springframework.beans.factory.annotation.Autowired
     public TokenService(AuthProperties properties) {
@@ -130,18 +134,24 @@ public class TokenService {
                 .map(p -> new TokenSubject(p.sub(), p.roles()));
     }
 
-    /** 区分"有效 / 已过期 / 已撤销或无效"的判定，供认证过滤器给出可区分的拒绝原因。 */
+    /**
+     * 区分"有效 / 已过期 / 已撤销或无效"的判定，供认证过滤器给出可区分的拒绝原因。
+     *
+     * <p>同一凭据在生命周期内的拒绝原因稳定不漂移：撤销（拒绝名单 / 撤销纪元）先于
+     * 有效期判定，因此一个被显式撤销的令牌在宽限窗口内即使越过自身 exp 仍判定为
+     * INVALID（已撤销），不会翻转为 EXPIRED。从未被撤销的令牌过期则稳定为 EXPIRED。
+     */
     public TokenStatus evaluateAccessToken(String token) {
         Optional<Payload> parsed = decode(token).filter(p -> TYPE_ACCESS.equals(p.type()));
         if (parsed.isEmpty()) {
             return TokenStatus.INVALID;
         }
         Payload p = parsed.get();
+        if (!notRevoked(p) || revokedAccessJti.containsKey(p.jti())) {
+            return TokenStatus.INVALID; // 撤销优先：拒绝原因不因到达 exp 而漂移
+        }
         if (!notExpired(p)) {
             return TokenStatus.EXPIRED;
-        }
-        if (!notRevoked(p) || revokedAccessJti.containsKey(p.jti())) {
-            return TokenStatus.INVALID;
         }
         return TokenStatus.VALID;
     }
@@ -190,7 +200,7 @@ public class TokenService {
                 && !m.credentialId().equals(keepCredentialId));
         accessRegistry.forEach((jti, meta) -> {
             if (meta.username().equals(username) && !meta.cid().equals(keepCredentialId)) {
-                revokedAccessJti.put(jti, meta.exp());
+                revokedAccessJti.putIfAbsent(jti, new RevokedAccess(meta.exp(), now));
                 accessRegistry.remove(jti, meta);
             }
         });
@@ -211,7 +221,7 @@ public class TokenService {
         });
         accessRegistry.forEach((jti, meta) -> {
             if (meta.cid().equals(credentialId) && meta.username().equals(username)) {
-                revokedAccessJti.put(jti, meta.exp());
+                revokedAccessJti.putIfAbsent(jti, new RevokedAccess(meta.exp(), clock.instant()));
                 accessRegistry.remove(jti, meta);
             }
         });
@@ -244,11 +254,16 @@ public class TokenService {
                 .toList();
     }
 
-    /** 惰性清理过期条目，避免注册表无界增长。 */
+    /**
+     * 惰性清理过期条目，避免注册表无界增长。拒绝名单条目在撤销后保留一个完整
+     * 访问 TTL 的宽限窗口：期间同一令牌的判定结果稳定保持 INVALID（已撤销），
+     * 即使越过令牌自身 exp 也不翻转为 EXPIRED。
+     */
     private void purgeExpired(Instant now) {
+        Duration grace = properties.getAccessTokenTtl();
         refreshRegistry.values().removeIf(m -> !now.isBefore(m.expiresAt()));
         accessRegistry.values().removeIf(m -> !now.isBefore(m.exp()));
-        revokedAccessJti.values().removeIf(exp -> !now.isBefore(exp));
+        revokedAccessJti.values().removeIf(r -> !now.isBefore(r.revokedAt().plus(grace)));
     }
 
     private boolean notExpired(Payload p) {

@@ -30,7 +30,11 @@ public class WebSecurityConfig {
         config.setAllowedOrigins(properties.getAllowedOrigins()); // 精确来源，不使用通配
         config.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"));
         config.setAllowedHeaders(List.of("Authorization", "Content-Type", CsrfFilter.CSRF_HEADER));
-        config.setExposedHeaders(List.of(CsrfFilter.CSRF_HEADER, AuthFilter.CORRELATION_HEADER));
+        config.setExposedHeaders(List.of(
+                CsrfFilter.CSRF_HEADER,
+                AuthFilter.CORRELATION_HEADER,
+                AuthFilter.SESSION_EXPIRES_AT_HEADER,
+                AuthFilter.SESSION_RENEWED_HEADER));
         config.setAllowCredentials(true);
         config.setMaxAge(3600L);
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();

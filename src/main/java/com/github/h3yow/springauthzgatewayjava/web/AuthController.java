@@ -106,7 +106,9 @@ public class AuthController {
     }
 
     private static String sessionCookie(SessionRecord session) {
-        long maxAge = Math.max(0, session.expiresAt().getEpochSecond() - session.createdAt().getEpochSecond());
+        // 新建会话：Max-Age 即空闲 TTL；后续滑动续期由认证过滤器按最新失效时间重写
+        long maxAge = Math.max(0,
+                java.time.Duration.between(java.time.Instant.now(), session.expiresAt()).getSeconds());
         return AuthFilter.SESSION_COOKIE + "=" + session.sessionId()
                 + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + maxAge;
     }
